@@ -412,13 +412,19 @@ def flush_shard(
     filename = f"shard-{shard_number:05d}.safetensors"
     path = rank_dir / filename
     combined = torch.cat(captured, dim=0)
-    save_file(
-        {
-            "embedding": combined[:, 0, :].contiguous(),
-            "hidden_states": combined[:, 1:, :].contiguous(),
-        },
-        path,
-    )
+    tensors = {
+        "embedding": combined[:, 0, :].contiguous(),
+        "hidden_states": combined[:, 1:, :].contiguous(),
+    }
+    # XLA SPMD tensors keep opaque storage whose data_ptr() is invalid
+    # even after .cpu(); roundtrip through xm.save / torch.load to
+    # obtain genuine CPU tensors that safetensors can serialise.
+    import io
+    buf = io.BytesIO()
+    xm.save(tensors, buf)
+    buf.seek(0)
+    cpu_tensors = torch.load(buf, map_location="cpu", weights_only=True)
+    save_file(cpu_tensors, path)
     relative = path.relative_to(output).as_posix()
     for offset, row in enumerate(pending_metadata):
         row.update(
@@ -627,13 +633,7 @@ def extract_spmd(
             # the duplicated padding records on the host. Slicing first could
             # create a leading dimension that is not divisible by the mesh.
             torch_xla.sync(wait=True)
-            # .cpu() transfers data but preserves XLAShardedTensor subclass
-            # whose __torch_function__ blocks safetensors' data_ptr().
-            # DisableTorchFunctionSubclass makes .clone() return a plain
-            # torch.Tensor with valid CPU storage.
-            host_xla = capture.stacked().cpu()[:real_count]
-            with torch._C.DisableTorchFunctionSubclass():
-                host = host_xla.clone()
+            host = capture.stacked().cpu()[:real_count]
             captured.append(host)
             for record, token_count, truncated in batch[:real_count]:
                 pending_metadata.append(
