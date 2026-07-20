@@ -628,10 +628,13 @@ def extract_spmd(
             # create a leading dimension that is not divisible by the mesh.
             torch_xla.sync(wait=True)
             # .cpu() transfers data but preserves XLAShardedTensor subclass
-            # whose __torch_function__ blocks safetensors' data_ptr() and
-            # .numpy().  Downcast to plain torch.Tensor to fix both.
-            host = capture.stacked().cpu()[:real_count]
-            captured.append(host.as_subclass(torch.Tensor))
+            # whose __torch_function__ blocks safetensors' data_ptr().
+            # DisableTorchFunctionSubclass makes .clone() return a plain
+            # torch.Tensor with valid CPU storage.
+            host_xla = capture.stacked().cpu()[:real_count]
+            with torch._C.DisableTorchFunctionSubclass():
+                host = host_xla.clone()
+            captured.append(host)
             for record, token_count, truncated in batch[:real_count]:
                 pending_metadata.append(
                     {
