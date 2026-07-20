@@ -10,21 +10,23 @@ assign correctness labels.
 
 ## Design
 
-- `torch_xla.launch` starts one process on every visible TPU device.
-- Input row positions are partitioned by `position % world_size`, so eight
-  workers process disjoint data concurrently.
-- Each worker holds one BF16 `MistralModel` replica. The language-model head is
-  omitted, `use_cache=False`, and `output_hidden_states=True` is never used.
+- The default SPMD/FSDP path loads one host model and shards its parameters and
+  batches over all eight TPU devices. This avoids eight ~14 GB host replicas
+  and leaves substantially more HBM headroom than data-parallel replication.
+- A legacy `--execution-mode replicated` path is retained for high-memory TPU
+  VMs, but is not recommended for Kaggle or 16 GB-per-device v5e slices.
+- The language-model head is omitted, `use_cache=False`, and
+  `output_hidden_states=True` is never used.
 - Forward hooks retain only `[:, -1, :]` from the embedding and each layer.
 - Static sequence buckets avoid recompilation for every input length.
 - Per-rank SafeTensors shards and metadata avoid write collisions.
-- Model loading is staggered by default to avoid eight simultaneous ~14 GB
-  host-memory peaks. Use `--parallel-model-load` only on a high-memory VM.
+- SPMD uses one Python process and one model load. The per-device batch size of
+  one becomes a static global batch of eight, padded only at the final step.
 
 At the safe default `--batch-size 1`, an eight-device slice has an effective
 batch size of eight.
 
-## Install on the TPU VM
+## Install on the TPU VM or Kaggle
 
 Python 3.12 and PyTorch/XLA 2.9 are the tested environment.
 
@@ -38,7 +40,20 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Optionally pre-download the pinned model once before spawning workers:
+Kaggle images commonly contain the accelerator-enabled TensorFlow package,
+which conflicts with PyTorch/XLA's TPU runtime. Run the following in a setup
+cell **once**, then use Kaggle's **Restart Session** command before importing
+`torch_xla` or running the extractor:
+
+```bash
+pip uninstall -y tensorflow tensorflow-tpu
+pip install tensorflow-cpu
+```
+
+The restart is mandatory: uninstalling the wheel does not unload a native TPU
+runtime that is already present in the notebook process.
+
+Optionally pre-download the pinned model once before starting extraction:
 
 ```bash
 hf download mistralai/Mistral-7B-Instruct-v0.3 \
@@ -65,8 +80,8 @@ forward pass.
 
 ## Run on all eight TPU devices
 
-No `torchrun` wrapper is needed. PyTorch/XLA launches one worker on every
-visible device:
+No `torchrun` wrapper is needed. The default SPMD execution mode controls and
+shards the model across every visible device from one host process:
 
 ```bash
 python extract_hidden_states.py \
@@ -78,6 +93,34 @@ python extract_hidden_states.py \
   --shard-size 64 \
   --buckets 128 256 512 1024 2048 \
   --expected-world-size 8
+```
+
+First verify a fresh Kaggle runtime with a one-record, shortest-bucket smoke
+test. SPMD pads its global batch across all eight devices. Use a separate
+output directory so its run configuration cannot collide with the full run:
+
+```bash
+python extract_hidden_states.py \
+  --input-jsonl examples/sample.jsonl \
+  --output-dir outputs/kaggle-smoke \
+  --max-samples 1 \
+  --batch-size 1 \
+  --buckets 128 \
+  --expected-world-size 8 \
+  --overwrite
+```
+
+If a diagnostic needs to isolate one physical device, use the legacy path:
+
+```bash
+python extract_hidden_states.py \
+  --input-jsonl examples/sample.jsonl \
+  --output-dir outputs/single-device-smoke \
+  --max-samples 1 \
+  --buckets 128 \
+  --execution-mode replicated \
+  --debug-single-process \
+  --overwrite
 ```
 
 For first-sentence truncation compatible with the released scanner, run a

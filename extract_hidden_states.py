@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Extract Mistral-7B last-token hidden states across eight TPU workers.
+"""Extract Mistral-7B last-token hidden states across an eight-device TPU slice.
 
-Each PyTorch/XLA worker owns one full BF16 ``MistralModel`` replica and a
-disjoint strided subset of the input JSONL.  With the default per-worker batch
-size of one, an eight-device slice has an effective batch size of eight.
+The default SPMD/FSDP mode loads one BF16 ``MistralModel`` and shards it across
+all physical devices. A legacy replicated mode assigns a full model and a
+disjoint input subset to each worker. With the default per-device batch size of
+one, either mode has an effective global batch size of eight.
 
 Only ``[:, -1, :]`` is retained from the embedding and every transformer
 block.  The script never enables ``output_hidden_states=True`` and disables the
@@ -13,6 +14,7 @@ KV cache, keeping per-worker HBM use bounded.
 from __future__ import annotations
 
 import argparse
+import functools
 import gc
 import hashlib
 import json
@@ -35,11 +37,13 @@ os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 os.environ.setdefault("OMP_NUM_THREADS", "4")
 
 import torch
+import numpy as np
 import torch_xla
 import torch_xla.core.xla_model as xm
 import torch_xla.runtime as xr
 from safetensors.torch import save_file
 from transformers import AutoTokenizer, MistralModel
+from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 from mistral_tpu8.core import (  # noqa: E402
@@ -75,6 +79,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shard-size", type=int, default=64)
     parser.add_argument("--buckets", type=int, nargs="+", default=list(DEFAULT_BUCKETS))
     parser.add_argument("--expected-world-size", type=int, default=8)
+    parser.add_argument(
+        "--execution-mode",
+        choices=("spmd_fsdp", "replicated"),
+        default="spmd_fsdp",
+        help=(
+            "spmd_fsdp loads one host model and shards it over all TPU devices; "
+            "replicated keeps one complete model per device and needs much more memory"
+        ),
+    )
     parser.add_argument("--parallel-model-load", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -164,6 +177,7 @@ def planned_config(args: argparse.Namespace) -> dict[str, Any]:
         "shard_size_per_worker": args.shard_size,
         "buckets": list(args.buckets),
         "expected_world_size": args.expected_world_size,
+        "execution_mode": args.execution_mode,
         "push_to_bucket": args.push_to_bucket,
         "bucket_prefix": args.bucket_prefix,
         "hidden_state_semantics": {
@@ -284,6 +298,90 @@ def load_model_for_rank(
     if model is None:
         raise RuntimeError("model was not initialized")
     return model, tokenizer
+
+
+def load_spmd_model(
+    args: argparse.Namespace,
+    device: torch.device,
+    physical_device_count: int,
+):
+    """Load one host model and shard its parameters over the TPU slice."""
+
+    import torch_xla.distributed.spmd as xs
+    from torch_xla.distributed.fsdp.wrap import transformer_auto_wrap_policy
+    from torch_xla.distributed.spmd.xla_sharded_tensor import XLAShardedTensor
+    from torch_xla.experimental.spmd_fully_sharded_data_parallel import (
+        SpmdFullyShardedDataParallel as FSDPv2,
+    )
+
+    mesh = xs.Mesh(
+        np.arange(physical_device_count),
+        (physical_device_count, 1),
+        ("fsdp", "model"),
+    )
+    xs.set_global_mesh(mesh)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_id,
+        revision=args.revision,
+        cache_dir=args.cache_dir,
+    )
+    tokenizer.padding_side = "left"
+    tokenizer.truncation_side = "left"
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    print(
+        f"SPMD: loading one host copy of {args.model_id} and sharding it over "
+        f"{physical_device_count} devices",
+        flush=True,
+    )
+    base_model = MistralModel.from_pretrained(
+        args.model_id,
+        revision=args.revision,
+        cache_dir=args.cache_dir,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        attn_implementation="sdpa",
+    )
+    base_model.config.use_cache = False
+    base_model.eval()
+    capture = LastTokenCapture(base_model)
+    auto_wrap_policy = functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={MistralDecoderLayer},
+    )
+
+    def shard_output(output: Any, output_mesh) -> None:
+        """Keep already-sharded Transformer outputs from being re-wrapped.
+
+        PyTorch/XLA 2.9 can propagate an ``XLAShardedTensor`` through the
+        Transformers output-capture decorator without its host-facing
+        ``global_tensor`` slot. Calling ``mark_sharding`` on that wrapper raises
+        ``AttributeError`` even though the underlying XLA value is already
+        sharded. Native XLA tensors still receive the explicit FSDP annotation.
+        """
+
+        real_output = output[0] if isinstance(output, tuple) else output
+        if not isinstance(real_output, torch.Tensor):
+            raise TypeError(f"unsupported FSDP output type: {type(output)}")
+        if isinstance(real_output, XLAShardedTensor):
+            return
+        partition_spec = ("fsdp",) + (None,) * (real_output.ndim - 1)
+        xs.mark_sharding(real_output, output_mesh, partition_spec)
+
+    # FSDPv2 moves the module to the SPMD virtual XLA device and shards every
+    # decoder layer separately. return_dict=False is used during extraction so
+    # its default output sharder sees a tuple whose first item is the activation.
+    model = FSDPv2(
+        base_model,
+        mesh=mesh,
+        auto_wrap_policy=auto_wrap_policy,
+        shard_output=shard_output,
+    )
+    torch_xla.sync(wait=True)
+    gc.collect()
+    print("SPMD: model parameters materialized and sharded", flush=True)
+    return model, tokenizer, capture, mesh
 
 
 def completed_for_rank(metadata_path: Path) -> set[int]:
@@ -453,9 +551,142 @@ def extract_rank(
     }
 
 
-def finalize_manifest(args: argparse.Namespace, world_size: int, rank_reports: list[bytes]) -> None:
+def extract_spmd(
+    args: argparse.Namespace,
+    physical_device_count: int,
+    device: torch.device,
+    model,
+    tokenizer: AutoTokenizer,
+    capture: LastTokenCapture,
+    mesh,
+) -> dict[str, Any]:
+    """Extract with one process and an FSDP-sharded model on all devices."""
+
+    import torch_xla.distributed.spmd as xs
+
+    records = load_records(args)
+    metadata_path = args.output_dir / "metadata-rank-000.jsonl"
+    done = completed_for_rank(metadata_path) if args.resume else set()
+    records = [record for record in records if record.source_index not in done]
+    buckets = tuple(args.buckets)
+    tokenized_lengths = (
+        tokenizer(
+            [record.text for record in records],
+            padding=False,
+            truncation=False,
+            add_special_tokens=False,
+            return_length=True,
+        )["length"]
+        if records
+        else []
+    )
+    grouped: dict[int, list[tuple[InputRecord, int, int]]] = defaultdict(list)
+    for record, token_count in zip(records, tokenized_lengths, strict=True):
+        bucket, truncated = assign_bucket(int(token_count), buckets)
+        grouped[bucket].append((record, int(token_count), truncated))
+
+    # --batch-size remains the per-device value. The global SPMD batch is
+    # padded so its leading dimension is divisible by the FSDP mesh.
+    global_batch_size = args.batch_size * physical_device_count
+    captured: list[torch.Tensor] = []
+    pending_metadata: list[dict[str, Any]] = []
+    shard_number = next_shard_number(args.output_dir / "states" / "rank-000")
+    processed = 0
+    started = time.perf_counter()
+
+    for bucket in buckets:
+        bucket_records = grouped.get(bucket, [])
+        for start in range(0, len(bucket_records), global_batch_size):
+            batch = bucket_records[start : start + global_batch_size]
+            real_count = len(batch)
+            if real_count < global_batch_size:
+                batch = batch + [batch[-1]] * (global_batch_size - real_count)
+            encoded = tokenizer(
+                [item[0].text for item in batch],
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=bucket,
+                add_special_tokens=False,
+            )
+            input_ids = encoded["input_ids"].to(device)
+            attention_mask = encoded["attention_mask"].to(device)
+            input_ids = xs.mark_sharding(input_ids, mesh, ("fsdp", None))
+            attention_mask = xs.mark_sharding(attention_mask, mesh, ("fsdp", None))
+            capture.clear()
+            with torch.no_grad():
+                output = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    output_hidden_states=False,
+                    return_dict=False,
+                )
+            del output, input_ids, attention_mask
+            # Gather the small [global_batch, 33, 4096] result, then discard
+            # the duplicated padding records on the host. Slicing first could
+            # create a leading dimension that is not divisible by the mesh.
+            torch_xla.sync(wait=True)
+            host = capture.stacked().cpu()[:real_count]
+            captured.append(host)
+            for record, token_count, truncated in batch[:real_count]:
+                pending_metadata.append(
+                    {
+                        "source_index": record.source_index,
+                        "input_sha256": hashlib.sha256(record.text.encode()).hexdigest(),
+                        "token_count": token_count,
+                        "bucket_length": bucket,
+                        "truncated_tokens": truncated,
+                        "label": record.label,
+                    }
+                )
+            processed += real_count
+            if sum(tensor.shape[0] for tensor in captured) >= args.shard_size:
+                flush_shard(
+                    args.output_dir,
+                    0,
+                    physical_device_count,
+                    shard_number,
+                    captured,
+                    pending_metadata,
+                )
+                shard_number += 1
+                captured.clear()
+                pending_metadata.clear()
+            print(
+                f"spmd processed={processed}/{len(records)} bucket={bucket} "
+                f"global_batch={global_batch_size}",
+                flush=True,
+            )
+
+    flush_shard(
+        args.output_dir,
+        0,
+        physical_device_count,
+        shard_number,
+        captured,
+        pending_metadata,
+    )
+    capture.close()
+    return {
+        "rank": 0,
+        "assigned_records": len(records) + len(done),
+        "previously_completed": len(done),
+        "processed_this_run": processed,
+        "elapsed_seconds": time.perf_counter() - started,
+    }
+
+
+def finalize_manifest(
+    args: argparse.Namespace,
+    world_size: int,
+    rank_reports: list[bytes],
+    *,
+    writer_count: int | None = None,
+) -> None:
+    writer_count = world_size if writer_count is None else writer_count
     metadata = []
-    for rank in range(world_size):
+    for rank in range(writer_count):
         path = args.output_dir / f"metadata-rank-{rank:03d}.jsonl"
         if path.exists():
             metadata.extend(read_jsonl(path))
@@ -479,6 +710,7 @@ def finalize_manifest(args: argparse.Namespace, world_size: int, rank_reports: l
     manifest = planned_config(args) | {
         "status": "complete",
         "world_size": world_size,
+        "writer_count": writer_count,
         "effective_batch_size": args.batch_size * world_size,
         "records": len(metadata),
         "tensor_rows": total_tensor_rows,
@@ -571,6 +803,40 @@ def worker(_index: int, args: argparse.Namespace) -> None:
     print(json.dumps(report, sort_keys=True), flush=True)
 
 
+def run_spmd(args: argparse.Namespace) -> None:
+    physical_device_count = xr.global_runtime_device_count()
+    if physical_device_count != args.expected_world_size:
+        raise RuntimeError(
+            f"expected {args.expected_world_size} physical TPU devices, observed "
+            f"{physical_device_count}; check the Kaggle accelerator/session"
+        )
+    device = torch_xla.device()
+    model, tokenizer, capture, mesh = load_spmd_model(
+        args,
+        device,
+        physical_device_count,
+    )
+    report = extract_spmd(
+        args,
+        physical_device_count,
+        device,
+        model,
+        tokenizer,
+        capture,
+        mesh,
+    )
+    finalize_manifest(
+        args,
+        physical_device_count,
+        [json.dumps(report).encode()],
+        writer_count=1,
+    )
+    receipt = upload_to_hf_bucket(args)
+    if receipt:
+        print(json.dumps(receipt, sort_keys=True), flush=True)
+    print(json.dumps(report, sort_keys=True), flush=True)
+
+
 def main() -> None:
     args = parse_args()
     args.input_jsonl = args.input_jsonl.resolve()
@@ -581,8 +847,18 @@ def main() -> None:
         raise ValueError("batch size and shard size must be positive")
     if args.push_to_bucket and not os.environ.get("HF_TOKEN"):
         raise RuntimeError("--push-to-bucket requires an exported HF_TOKEN")
+    if args.execution_mode == "spmd_fsdp" and args.debug_single_process:
+        raise ValueError("--debug-single-process is only valid with --execution-mode replicated")
+    if args.execution_mode == "spmd_fsdp" and args.parallel_model_load:
+        raise ValueError("--parallel-model-load is only valid with --execution-mode replicated")
     prepare_output(args)
-    torch_xla.launch(worker, args=(args,), debug_single_process=args.debug_single_process)
+    if args.execution_mode == "spmd_fsdp":
+        # SPMD is deliberately a single host process controlling all devices.
+        # It must be enabled before the first XLA tensor/device is created.
+        xr.use_spmd()
+        run_spmd(args)
+    else:
+        torch_xla.launch(worker, args=(args,), debug_single_process=args.debug_single_process)
 
 
 if __name__ == "__main__":

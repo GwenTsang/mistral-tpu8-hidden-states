@@ -36,9 +36,10 @@ def main() -> None:
     root = args.artifact.resolve()
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     world_size = int(manifest["world_size"])
+    writer_count = int(manifest.get("writer_count", world_size))
     problems: list[str] = []
     metadata: list[dict] = []
-    for rank in range(world_size):
+    for rank in range(writer_count):
         path = root / f"metadata-rank-{rank:03d}.jsonl"
         if not path.exists():
             problems.append(f"missing {path.name}")
@@ -112,6 +113,7 @@ def main() -> None:
         "model_id": manifest["model_id"],
         "revision": manifest["revision"],
         "world_size": world_size,
+        "writer_count": writer_count,
         "records": tensor_rows,
         "shards": len(observed_files),
         "dtype": "bfloat16",
