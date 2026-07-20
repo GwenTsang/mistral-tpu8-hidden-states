@@ -1111,12 +1111,14 @@ def extract_spmd(
                 "attention_mask"
             ].to(device)
 
-            input_ids = xs.mark_sharding(
+            # Preserve the ordinary XLA tensor. mark_sharding applies the annotation
+            # in place; its XLAShardedTensor return value is intentionally discarded.
+            xs.mark_sharding(
                 input_ids,
                 mesh,
                 ("fsdp", None),
             )
-            attention_mask = xs.mark_sharding(
+            xs.mark_sharding(
                 attention_mask,
                 mesh,
                 ("fsdp", None),
