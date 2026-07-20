@@ -1,0 +1,3 @@
+{"context":"France has Paris as its capital.","question":"What is the capital of France?","best_answer":"Paris.","label":1}
+{"context":"The Moon orbits Earth.","question":"What does the Moon orbit?","best_answer":"Earth.","label":1}
+{"text":"A fully prejoined prompt and answer can also be supplied directly."}

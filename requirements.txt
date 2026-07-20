@@ -1,0 +1,6 @@
+torch==2.9.0
+torch_xla[tpu]==2.9.0
+transformers==5.13.1
+accelerate==1.14.0
+safetensors==0.8.0
+huggingface_hub==1.24.0

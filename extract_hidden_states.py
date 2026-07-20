@@ -1,0 +1,589 @@
+#!/usr/bin/env python3
+"""Extract Mistral-7B last-token hidden states across eight TPU workers.
+
+Each PyTorch/XLA worker owns one full BF16 ``MistralModel`` replica and a
+disjoint strided subset of the input JSONL.  With the default per-worker batch
+size of one, an eight-device slice has an effective batch size of eight.
+
+Only ``[:, -1, :]`` is retained from the embedding and every transformer
+block.  The script never enables ``output_hidden_states=True`` and disables the
+KV cache, keeping per-worker HBM use bounded.
+"""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import hashlib
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import time
+from collections import defaultdict
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any, Iterable
+
+# These must be set before importing torch_xla.
+os.environ.setdefault("PJRT_DEVICE", "TPU")
+os.environ.setdefault("XLA_NO_SPECIAL_SCALARS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+
+import torch
+import torch_xla
+import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
+from safetensors.torch import save_file
+from transformers import AutoTokenizer, MistralModel
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+from mistral_tpu8.core import (  # noqa: E402
+    InputRecord,
+    assign_bucket,
+    record_from_mapping,
+    worker_source_indices,
+)
+
+
+DEFAULT_MODEL = "mistralai/Mistral-7B-Instruct-v0.3"
+DEFAULT_REVISION = "c170c708c41dac9275d15a8fff4eca08d52bab71"
+DEFAULT_BUCKETS = (128, 256, 512, 1024, 2048)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input-jsonl", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--model-id", default=DEFAULT_MODEL)
+    parser.add_argument("--revision", default=DEFAULT_REVISION)
+    parser.add_argument("--cache-dir", type=Path, default=Path(".cache/huggingface"))
+    parser.add_argument("--text-column", default="text")
+    parser.add_argument("--answer-column", default="best_answer")
+    parser.add_argument(
+        "--answer-view",
+        choices=("full", "first_sentence"),
+        default="full",
+    )
+    parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--start-index", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--shard-size", type=int, default=64)
+    parser.add_argument("--buckets", type=int, nargs="+", default=list(DEFAULT_BUCKETS))
+    parser.add_argument("--expected-world-size", type=int, default=8)
+    parser.add_argument("--parallel-model-load", action="store_true")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--debug-single-process", action="store_true")
+    parser.add_argument(
+        "--push-to-bucket",
+        metavar="OWNER/BUCKET",
+        help="After extraction, create/sync to this Hugging Face Bucket using HF_TOKEN.",
+    )
+    parser.add_argument(
+        "--bucket-prefix",
+        help="Destination prefix inside the bucket (default: output directory name).",
+    )
+    return parser.parse_args()
+
+
+def json_hash(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_json(path: Path, value: object) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def append_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    with path.open(encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def load_records(args: argparse.Namespace) -> list[InputRecord]:
+    stop = args.start_index + args.max_samples if args.max_samples else None
+    records: list[InputRecord] = []
+    with args.input_jsonl.open(encoding="utf-8") as handle:
+        for index, line in enumerate(handle):
+            if index < args.start_index:
+                continue
+            if stop is not None and index >= stop:
+                break
+            line = line.strip()
+            if line:
+                records.append(
+                    record_from_mapping(
+                        json.loads(line),
+                        source_index=index,
+                        text_column=args.text_column,
+                        answer_column=args.answer_column,
+                        answer_view=args.answer_view,
+                    )
+                )
+    if not records:
+        raise ValueError("input selection produced no records")
+    return records
+
+
+def planned_config(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "model_id": args.model_id,
+        "revision": args.revision,
+        "input_jsonl": str(args.input_jsonl.resolve()),
+        "input_sha256": sha256(args.input_jsonl),
+        "text_column": args.text_column,
+        "answer_column": args.answer_column,
+        "answer_view": args.answer_view,
+        "max_samples": args.max_samples,
+        "start_index": args.start_index,
+        "batch_size_per_worker": args.batch_size,
+        "shard_size_per_worker": args.shard_size,
+        "buckets": list(args.buckets),
+        "expected_world_size": args.expected_world_size,
+        "push_to_bucket": args.push_to_bucket,
+        "bucket_prefix": args.bucket_prefix,
+        "hidden_state_semantics": {
+            "0..30": "post-transformer-block, pre-final-RMSNorm",
+            "31": "post-transformer-block-31 and post-final-RMSNorm",
+        },
+    }
+
+
+def prepare_output(args: argparse.Namespace) -> None:
+    output = args.output_dir.resolve()
+    forbidden = {Path("/").resolve(), Path.home().resolve(), Path.cwd().resolve()}
+    if output in forbidden:
+        raise ValueError(f"refusing to use broad output directory: {output}")
+    if args.overwrite and output.exists():
+        shutil.rmtree(output)
+    output.mkdir(parents=True, exist_ok=True)
+    existing = output / "run_config.json"
+    config = planned_config(args)
+    config["config_sha256"] = json_hash(config)
+    if existing.exists():
+        previous = json.loads(existing.read_text(encoding="utf-8"))
+        if previous != config:
+            raise ValueError(
+                f"{output} belongs to a different run; use a new directory or --overwrite"
+            )
+        if not args.resume:
+            raise FileExistsError(f"{output} already contains a run; pass --resume or --overwrite")
+    else:
+        write_json(existing, config)
+
+
+class LastTokenCapture:
+    """Hooks that retain only one token vector from each required stage."""
+
+    def __init__(self, model: MistralModel):
+        self.embedding: torch.Tensor | None = None
+        self.layers: dict[int, torch.Tensor] = {}
+        self.handles = [model.embed_tokens.register_forward_hook(self._embedding_hook)]
+        # Transformers hidden_states[1:] contains post-layer 0..30, followed by
+        # the post-final-norm state after layer 31.
+        for index, layer in enumerate(model.layers[:-1]):
+            self.handles.append(layer.register_forward_hook(self._layer_hook(index)))
+        self.handles.append(model.norm.register_forward_hook(self._norm_hook))
+
+    def clear(self) -> None:
+        self.embedding = None
+        self.layers.clear()
+
+    def _embedding_hook(self, _module: Any, _inputs: Any, output: torch.Tensor) -> None:
+        self.embedding = output[:, -1, :].clone()
+
+    def _layer_hook(self, index: int):
+        def hook(_module: Any, _inputs: Any, output: Any) -> None:
+            hidden = output[0] if isinstance(output, tuple) else output
+            self.layers[index] = hidden[:, -1, :].clone()
+
+        return hook
+
+    def _norm_hook(self, _module: Any, _inputs: Any, output: torch.Tensor) -> None:
+        self.layers[31] = output[:, -1, :].clone()
+
+    def stacked(self) -> torch.Tensor:
+        if self.embedding is None or set(self.layers) != set(range(32)):
+            raise RuntimeError(f"incomplete hook capture: layers={sorted(self.layers)}")
+        return torch.cat(
+            [self.embedding[:, None, :], torch.stack([self.layers[index] for index in range(32)], dim=1)],
+            dim=1,
+        )
+
+    def close(self) -> None:
+        for handle in self.handles:
+            handle.remove()
+
+
+def load_model_for_rank(
+    args: argparse.Namespace,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+) -> tuple[MistralModel, AutoTokenizer]:
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_id,
+        revision=args.revision,
+        cache_dir=args.cache_dir,
+    )
+    tokenizer.padding_side = "left"
+    tokenizer.truncation_side = "left"
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    def load() -> MistralModel:
+        model = MistralModel.from_pretrained(
+            args.model_id,
+            revision=args.revision,
+            cache_dir=args.cache_dir,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            attn_implementation="sdpa",
+        )
+        model.config.use_cache = False
+        model.eval()
+        model.to(device)
+        torch_xla.sync(wait=True)
+        gc.collect()
+        return model
+
+    model: MistralModel | None = None
+    if args.parallel_model_load:
+        model = load()
+        xm.rendezvous("all-models-loaded")
+    else:
+        # Avoid eight simultaneous ~14 GB host-memory peaks.
+        for loader_rank in range(world_size):
+            if rank == loader_rank:
+                model = load()
+            xm.rendezvous(f"model-loaded-rank-{loader_rank}")
+    if model is None:
+        raise RuntimeError("model was not initialized")
+    return model, tokenizer
+
+
+def completed_for_rank(metadata_path: Path) -> set[int]:
+    if not metadata_path.exists():
+        return set()
+    return {int(row["source_index"]) for row in read_jsonl(metadata_path)}
+
+
+def next_shard_number(rank_dir: Path) -> int:
+    numbers = []
+    for path in rank_dir.glob("shard-*.safetensors"):
+        numbers.append(int(path.stem.split("-")[-1]))
+    return max(numbers, default=-1) + 1
+
+
+def flush_shard(
+    output: Path,
+    rank: int,
+    world_size: int,
+    shard_number: int,
+    captured: list[torch.Tensor],
+    pending_metadata: list[dict[str, Any]],
+) -> None:
+    if not captured:
+        return
+    rank_dir = output / "states" / f"rank-{rank:03d}"
+    rank_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"shard-{shard_number:05d}.safetensors"
+    path = rank_dir / filename
+    combined = torch.cat(captured, dim=0).contiguous()
+    save_file(
+        {
+            "embedding": combined[:, 0, :],
+            "hidden_states": combined[:, 1:, :],
+        },
+        path,
+    )
+    relative = path.relative_to(output).as_posix()
+    for offset, row in enumerate(pending_metadata):
+        row.update(
+            {
+                "shard": relative,
+                "offset": offset,
+                "rank": rank,
+                "world_size": world_size,
+            }
+        )
+    append_jsonl(output / f"metadata-rank-{rank:03d}.jsonl", pending_metadata)
+
+
+def extract_rank(
+    args: argparse.Namespace,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    model: MistralModel,
+    tokenizer: AutoTokenizer,
+) -> dict[str, Any]:
+    all_records = load_records(args)
+    source_to_record = {record.source_index: record for record in all_records}
+    selected_indices = worker_source_indices(len(all_records), rank, world_size)
+    # source indices may start after zero because --start-index applies to the
+    # input file; map the worker position to the actual input source index.
+    actual_sources = [all_records[position].source_index for position in selected_indices]
+    metadata_path = args.output_dir / f"metadata-rank-{rank:03d}.jsonl"
+    done = completed_for_rank(metadata_path) if args.resume else set()
+    records = [source_to_record[index] for index in actual_sources if index not in done]
+    capture = LastTokenCapture(model)
+    buckets = tuple(args.buckets)
+    tokenized_lengths = tokenizer(
+        [record.text for record in records],
+        padding=False,
+        truncation=False,
+        add_special_tokens=False,
+        return_length=True,
+    )["length"] if records else []
+    grouped: dict[int, list[tuple[InputRecord, int, int]]] = defaultdict(list)
+    for record, token_count in zip(records, tokenized_lengths, strict=True):
+        bucket, truncated = assign_bucket(int(token_count), buckets)
+        grouped[bucket].append((record, int(token_count), truncated))
+
+    captured: list[torch.Tensor] = []
+    pending_metadata: list[dict[str, Any]] = []
+    shard_number = next_shard_number(args.output_dir / "states" / f"rank-{rank:03d}")
+    processed = 0
+    started = time.perf_counter()
+
+    for bucket in buckets:
+        bucket_records = grouped.get(bucket, [])
+        for start in range(0, len(bucket_records), args.batch_size):
+            batch = bucket_records[start : start + args.batch_size]
+            real_count = len(batch)
+            # Pad the final batch by repeating its last record so every graph
+            # for a bucket has the same static [batch, sequence] shape.
+            if real_count < args.batch_size:
+                batch = batch + [batch[-1]] * (args.batch_size - real_count)
+            texts = [item[0].text for item in batch]
+            encoded = tokenizer(
+                texts,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=bucket,
+                add_special_tokens=False,
+            )
+            capture.clear()
+            # ``torch.inference_mode`` produces version-counter-free tensors;
+            # Transformers' rotary embedding path moves one such tensor to XLA
+            # and fails. ``no_grad`` has the same memory goal without that XLA
+            # incompatibility.
+            with torch.no_grad():
+                output = model(
+                    input_ids=encoded["input_ids"].to(device),
+                    attention_mask=encoded["attention_mask"].to(device),
+                    use_cache=False,
+                    return_dict=True,
+                )
+            del output
+            stacked = capture.stacked()[:real_count]
+            torch_xla.sync(wait=True)
+            host = stacked.cpu()
+            captured.append(host)
+            for record, token_count, truncated in batch[:real_count]:
+                pending_metadata.append(
+                    {
+                        "source_index": record.source_index,
+                        "input_sha256": hashlib.sha256(record.text.encode()).hexdigest(),
+                        "token_count": token_count,
+                        "bucket_length": bucket,
+                        "truncated_tokens": truncated,
+                        "label": record.label,
+                    }
+                )
+            processed += real_count
+            if sum(tensor.shape[0] for tensor in captured) >= args.shard_size:
+                flush_shard(
+                    args.output_dir,
+                    rank,
+                    world_size,
+                    shard_number,
+                    captured,
+                    pending_metadata,
+                )
+                shard_number += 1
+                captured.clear()
+                pending_metadata.clear()
+            if processed % 32 == 0:
+                print(
+                    f"rank={rank}/{world_size} processed={processed}/{len(records)} bucket={bucket}",
+                    flush=True,
+                )
+    flush_shard(
+        args.output_dir,
+        rank,
+        world_size,
+        shard_number,
+        captured,
+        pending_metadata,
+    )
+    capture.close()
+    return {
+        "rank": rank,
+        "assigned_records": len(actual_sources),
+        "previously_completed": len(done),
+        "processed_this_run": processed,
+        "elapsed_seconds": time.perf_counter() - started,
+    }
+
+
+def finalize_manifest(args: argparse.Namespace, world_size: int, rank_reports: list[bytes]) -> None:
+    metadata = []
+    for rank in range(world_size):
+        path = args.output_dir / f"metadata-rank-{rank:03d}.jsonl"
+        if path.exists():
+            metadata.extend(read_jsonl(path))
+    files = []
+    total_tensor_rows = 0
+    for path in sorted((args.output_dir / "states").glob("rank-*/shard-*.safetensors")):
+        from safetensors import safe_open
+
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            rows = int(handle.get_slice("hidden_states").get_shape()[0])
+        total_tensor_rows += rows
+        files.append(
+            {
+                "path": path.relative_to(args.output_dir).as_posix(),
+                "bytes": path.stat().st_size,
+                "rows": rows,
+                "sha256": sha256(path),
+            }
+        )
+    reports = [json.loads(payload.decode()) for payload in rank_reports]
+    manifest = planned_config(args) | {
+        "status": "complete",
+        "world_size": world_size,
+        "effective_batch_size": args.batch_size * world_size,
+        "records": len(metadata),
+        "tensor_rows": total_tensor_rows,
+        "num_shards": len(files),
+        "dtype": "bfloat16",
+        "embedding_shape_per_record": [4096],
+        "hidden_states_shape_per_record": [32, 4096],
+        "architecture": "MistralModel (language-model head omitted)",
+        "use_cache": False,
+        "output_hidden_states": False,
+        "token_position": "last non-padding token; tokenizer uses left padding and left truncation",
+        "python": sys.version,
+        "platform": platform.platform(),
+        "torch": torch.__version__,
+        "torch_xla": torch_xla.__version__,
+        "rank_reports": sorted(reports, key=lambda report: report["rank"]),
+        "files": files,
+    }
+    write_json(args.output_dir / "manifest.json", manifest)
+
+
+def upload_to_hf_bucket(args: argparse.Namespace) -> dict[str, Any] | None:
+    if not args.push_to_bucket:
+        return None
+    if not os.environ.get("HF_TOKEN"):
+        raise RuntimeError("--push-to-bucket requires an exported HF_TOKEN")
+    parts = args.push_to_bucket.strip("/").split("/")
+    if len(parts) != 2 or not all(parts):
+        raise ValueError("--push-to-bucket must be OWNER/BUCKET")
+    prefix = (args.bucket_prefix or args.output_dir.name).strip("/")
+    if not prefix:
+        raise ValueError("bucket prefix cannot be empty")
+    destination = f"{args.push_to_bucket}/{prefix}"
+    destination_uri = f"hf://buckets/{destination}"
+    started = time.perf_counter()
+    subprocess.run(
+        ["hf", "buckets", "create", args.push_to_bucket, "--exist-ok"],
+        check=True,
+        env=os.environ.copy(),
+    )
+    subprocess.run(
+        ["hf", "buckets", "sync", str(args.output_dir), destination_uri],
+        check=True,
+        env=os.environ.copy(),
+    )
+    receipt = {
+        "status": "complete",
+        "bucket": args.push_to_bucket,
+        "prefix": prefix,
+        "url": f"https://huggingface.co/buckets/{args.push_to_bucket}#{prefix}",
+        "elapsed_seconds": time.perf_counter() - started,
+    }
+    write_json(args.output_dir / "upload.json", receipt)
+    # The first sync necessarily precedes upload.json; copy the receipt last.
+    subprocess.run(
+        [
+            "hf",
+            "buckets",
+            "cp",
+            str(args.output_dir / "upload.json"),
+            f"{destination_uri}/upload.json",
+        ],
+        check=True,
+        env=os.environ.copy(),
+    )
+    return receipt
+
+
+def worker(_index: int, args: argparse.Namespace) -> None:
+    rank = xr.global_ordinal()
+    world_size = xr.world_size()
+    expected = 1 if args.debug_single_process else args.expected_world_size
+    if world_size != expected:
+        raise RuntimeError(
+            f"expected {expected} XLA workers, observed {world_size}; "
+            "check TPU topology or pass --expected-world-size"
+        )
+    device = torch_xla.device()
+    model, tokenizer = load_model_for_rank(args, rank, world_size, device)
+    report = extract_rank(args, rank, world_size, device, model, tokenizer)
+    payloads = xm.rendezvous("extraction-finished", json.dumps(report).encode())
+    if rank == 0:
+        finalize_manifest(args, world_size, payloads)
+    xm.rendezvous("manifest-written")
+    if rank == 0:
+        receipt = upload_to_hf_bucket(args)
+        if receipt:
+            print(json.dumps(receipt, sort_keys=True), flush=True)
+    xm.rendezvous("optional-upload-finished")
+    print(json.dumps(report, sort_keys=True), flush=True)
+
+
+def main() -> None:
+    args = parse_args()
+    args.input_jsonl = args.input_jsonl.resolve()
+    args.output_dir = args.output_dir.resolve()
+    args.cache_dir = args.cache_dir.resolve()
+    args.buckets = sorted(set(args.buckets))
+    if args.batch_size < 1 or args.shard_size < 1:
+        raise ValueError("batch size and shard size must be positive")
+    if args.push_to_bucket and not os.environ.get("HF_TOKEN"):
+        raise RuntimeError("--push-to-bucket requires an exported HF_TOKEN")
+    prepare_output(args)
+    torch_xla.launch(worker, args=(args,), debug_single_process=args.debug_single_process)
+
+
+if __name__ == "__main__":
+    main()
