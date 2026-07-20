@@ -411,7 +411,7 @@ def flush_shard(
     rank_dir.mkdir(parents=True, exist_ok=True)
     filename = f"shard-{shard_number:05d}.safetensors"
     path = rank_dir / filename
-    combined = torch.cat(captured, dim=0).contiguous()
+    combined = torch.cat(captured, dim=0).contiguous().cpu()
     save_file(
         {
             "embedding": combined[:, 0, :],
