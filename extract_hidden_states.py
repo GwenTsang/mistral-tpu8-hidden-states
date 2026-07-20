@@ -228,25 +228,29 @@ class LastTokenCapture:
         self.layers.clear()
 
     def _embedding_hook(self, _module: Any, _inputs: Any, output: torch.Tensor) -> None:
-        self.embedding = output[:, -1, :].clone()
+        with torch._C.DisableTorchFunctionSubclass():
+            self.embedding = output[:, -1, :].clone()
 
     def _layer_hook(self, index: int):
         def hook(_module: Any, _inputs: Any, output: Any) -> None:
             hidden = output[0] if isinstance(output, tuple) else output
-            self.layers[index] = hidden[:, -1, :].clone()
+            with torch._C.DisableTorchFunctionSubclass():
+                self.layers[index] = hidden[:, -1, :].clone()
 
         return hook
 
     def _norm_hook(self, _module: Any, _inputs: Any, output: torch.Tensor) -> None:
-        self.layers[31] = output[:, -1, :].clone()
+        with torch._C.DisableTorchFunctionSubclass():
+            self.layers[31] = output[:, -1, :].clone()
 
     def stacked(self) -> torch.Tensor:
         if self.embedding is None or set(self.layers) != set(range(32)):
             raise RuntimeError(f"incomplete hook capture: layers={sorted(self.layers)}")
-        return torch.cat(
-            [self.embedding[:, None, :], torch.stack([self.layers[index] for index in range(32)], dim=1)],
-            dim=1,
-        )
+        with torch._C.DisableTorchFunctionSubclass():
+            return torch.cat(
+                [self.embedding[:, None, :], torch.stack([self.layers[index] for index in range(32)], dim=1)],
+                dim=1,
+            )
 
     def close(self) -> None:
         for handle in self.handles:
@@ -623,15 +627,12 @@ def extract_spmd(
                     return_dict=False,
                 )
             del output, input_ids, attention_mask
-            # Disable XLAShardedTensor.__torch_function__ for the entire
-            # capture-to-CPU pipeline so that stacked(), .cpu(), slicing
-            # and .numpy() all operate on plain torch.Tensor objects,
-            # producing CPU tensors with valid storage for safetensors.
-            with torch._C.DisableTorchFunctionSubclass():
-                stacked = capture.stacked()
-                torch_xla.sync(wait=True)
-                host_np = stacked.cpu().numpy()[:real_count]
-            captured.append(torch.from_numpy(host_np.copy()))
+            # Hooks and stacked() now produce plain XLA tensors (not
+            # XLAShardedTensor) thanks to DisableTorchFunctionSubclass
+            # in the hooks.  Plain .cpu() gives valid CPU storage.
+            torch_xla.sync(wait=True)
+            host = capture.stacked().cpu()[:real_count]
+            captured.append(host)
             for record, token_count, truncated in batch[:real_count]:
                 pending_metadata.append(
                     {
