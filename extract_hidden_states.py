@@ -412,12 +412,14 @@ def flush_shard(
     filename = f"shard-{shard_number:05d}.safetensors"
     path = rank_dir / filename
     combined = torch.cat(captured, dim=0)
-    embedding = combined[:, 0, :].contiguous().cpu().clone()
-    hidden_states = combined[:, 1:, :].contiguous().cpu().clone()
+    # XLA tensors retain opaque storage even after .cpu()/.clone();
+    # round-trip through numpy to guarantee native CPU storage for safetensors.
+    emb_np = combined[:, 0, :].cpu().float().numpy()
+    hs_np = combined[:, 1:, :].cpu().float().numpy()
     save_file(
         {
-            "embedding": embedding,
-            "hidden_states": hidden_states,
+            "embedding": torch.from_numpy(emb_np),
+            "hidden_states": torch.from_numpy(hs_np),
         },
         path,
     )
