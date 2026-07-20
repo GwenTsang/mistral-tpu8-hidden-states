@@ -627,14 +627,11 @@ def extract_spmd(
             # the duplicated padding records on the host. Slicing first could
             # create a leading dimension that is not divisible by the mesh.
             torch_xla.sync(wait=True)
-            # clear_sharding converts XlaShardedTensor → regular XLA tensor,
-            # then .cpu().numpy() round-trips to native CPU storage that
-            # safetensors can serialise (XlaShardedTensor.cpu() keeps opaque
-            # storage whose data_ptr() is invalid).
-            xla_result = capture.stacked()
-            xs.clear_sharding(xla_result)
-            host_np = xla_result.cpu().numpy()[:real_count]
-            captured.append(torch.from_numpy(host_np))
+            # .cpu() transfers data but preserves XLAShardedTensor subclass
+            # whose __torch_function__ blocks safetensors' data_ptr() and
+            # .numpy().  Downcast to plain torch.Tensor to fix both.
+            host = capture.stacked().cpu()[:real_count]
+            captured.append(host.as_subclass(torch.Tensor))
             for record, token_count, truncated in batch[:real_count]:
                 pending_metadata.append(
                     {
