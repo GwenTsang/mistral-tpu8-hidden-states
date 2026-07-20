@@ -411,11 +411,13 @@ def flush_shard(
     rank_dir.mkdir(parents=True, exist_ok=True)
     filename = f"shard-{shard_number:05d}.safetensors"
     path = rank_dir / filename
-    combined = torch.cat(captured, dim=0).contiguous().cpu()
+    combined = torch.cat(captured, dim=0)
+    embedding = combined[:, 0, :].contiguous().cpu().clone()
+    hidden_states = combined[:, 1:, :].contiguous().cpu().clone()
     save_file(
         {
-            "embedding": combined[:, 0, :],
-            "hidden_states": combined[:, 1:, :],
+            "embedding": embedding,
+            "hidden_states": hidden_states,
         },
         path,
     )
