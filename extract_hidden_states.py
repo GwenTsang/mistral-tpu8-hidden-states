@@ -228,33 +228,77 @@ class LastTokenCapture:
         self.layers.clear()
 
     def _embedding_hook(self, _module: Any, _inputs: Any, output: torch.Tensor) -> None:
-        with torch._C.DisableTorchFunctionSubclass():
-            self.embedding = output[:, -1, :].clone()
+        self.embedding = output[:, -1, :].clone()
 
     def _layer_hook(self, index: int):
         def hook(_module: Any, _inputs: Any, output: Any) -> None:
             hidden = output[0] if isinstance(output, tuple) else output
-            with torch._C.DisableTorchFunctionSubclass():
-                self.layers[index] = hidden[:, -1, :].clone()
+            self.layers[index] = hidden[:, -1, :].clone()
 
         return hook
 
     def _norm_hook(self, _module: Any, _inputs: Any, output: torch.Tensor) -> None:
-        with torch._C.DisableTorchFunctionSubclass():
-            self.layers[31] = output[:, -1, :].clone()
+        self.layers[31] = output[:, -1, :].clone()
 
     def stacked(self) -> torch.Tensor:
         if self.embedding is None or set(self.layers) != set(range(32)):
             raise RuntimeError(f"incomplete hook capture: layers={sorted(self.layers)}")
-        with torch._C.DisableTorchFunctionSubclass():
-            return torch.cat(
-                [self.embedding[:, None, :], torch.stack([self.layers[index] for index in range(32)], dim=1)],
-                dim=1,
-            )
+        return torch.cat(
+            [self.embedding[:, None, :], torch.stack([self.layers[index] for index in range(32)], dim=1)],
+            dim=1,
+        )
 
     def close(self) -> None:
         for handle in self.handles:
             handle.remove()
+
+
+def spmd_tensor_to_cpu(tensor: torch.Tensor) -> torch.Tensor:
+    """Materialize an SPMD result as an ordinary CPU tensor.
+
+    ``XLAShardedTensor`` is a storage-less wrapper subclass. Its ``.cpu()``
+    result is another wrapper, so serializers that inspect its storage see an
+    invalid data pointer. ``xm.save`` does not help here because PyTorch/XLA
+    2.9's conversion arena deliberately selects only exact ``torch.Tensor``
+    instances and therefore skips subclasses.
+
+    Unwrap every wrapper layer before asking the XLA runtime for host tensors.
+    The low-level transfer returns a real, storage-backed CPU ``torch.Tensor``.
+    """
+
+    from torch_xla.distributed.spmd.xla_sharded_tensor import XLAShardedTensor
+
+    wrapper_depth = 0
+    while isinstance(tensor, XLAShardedTensor):
+        if not hasattr(tensor, "global_tensor"):
+            raise RuntimeError(
+                "PyTorch/XLA returned an XLAShardedTensor without global_tensor; "
+                "cannot safely materialize this activation on the host"
+            )
+        tensor = tensor.global_tensor
+        wrapper_depth += 1
+        if wrapper_depth > 16:
+            raise RuntimeError("cyclic or excessively nested XLAShardedTensor wrappers")
+
+    if type(tensor) is not torch.Tensor or tensor.device.type != "xla":
+        raise RuntimeError(
+            "expected an unwrapped XLA torch.Tensor, got "
+            f"type={type(tensor).__name__} device={tensor.device}"
+        )
+
+    torch_xla._XLAC._xla_sync_multi(
+        [tensor], devices=[], wait=True, sync_xla_data=False
+    )
+    host = torch_xla._XLAC._xla_get_cpu_tensors([tensor])[0]
+    if type(host) is not torch.Tensor or host.device.type != "cpu":
+        raise RuntimeError(
+            "XLA host transfer did not return a base CPU tensor: "
+            f"type={type(host).__name__} device={host.device}"
+        )
+    # Fail at the transfer boundary with a focused error instead of much later
+    # inside safetensors' shared-storage discovery.
+    host.untyped_storage().data_ptr()
+    return host
 
 
 def load_model_for_rank(
@@ -627,11 +671,10 @@ def extract_spmd(
                     return_dict=False,
                 )
             del output, input_ids, attention_mask
-            # Hooks and stacked() now produce plain XLA tensors (not
-            # XLAShardedTensor) thanks to DisableTorchFunctionSubclass
-            # in the hooks.  Plain .cpu() gives valid CPU storage.
-            torch_xla.sync(wait=True)
-            host = capture.stacked().cpu()[:real_count]
+            # Keep XLAShardedTensor dispatch active while composing the hook
+            # captures, then explicitly unwrap and materialize the underlying
+            # XLA tensor as storage-backed host memory.
+            host = spmd_tensor_to_cpu(capture.stacked())[:real_count]
             captured.append(host)
             for record, token_count, truncated in batch[:real_count]:
                 pending_metadata.append(
