@@ -623,17 +623,14 @@ def extract_spmd(
                     return_dict=False,
                 )
             del output, input_ids, attention_mask
-            # In SPMD the hook outputs are implicitly sharded on the
-            # batch ("fsdp") axis.  Mark as fully replicated to trigger
-            # an all-gather, sync, then round-trip through numpy so the
-            # resulting CPU tensors have native storage that safetensors
-            # can serialise.
-            stacked = capture.stacked()
-            stacked = xs.mark_sharding(
-                stacked, mesh, (None,) * stacked.ndim
-            )
-            torch_xla.sync(wait=True)
-            host_np = stacked.cpu().detach().numpy()[:real_count]
+            # Disable XLAShardedTensor.__torch_function__ for the entire
+            # capture-to-CPU pipeline so that stacked(), .cpu(), slicing
+            # and .numpy() all operate on plain torch.Tensor objects,
+            # producing CPU tensors with valid storage for safetensors.
+            with torch._C.DisableTorchFunctionSubclass():
+                stacked = capture.stacked()
+                torch_xla.sync(wait=True)
+                host_np = stacked.cpu().numpy()[:real_count]
             captured.append(torch.from_numpy(host_np.copy()))
             for record, token_count, truncated in batch[:real_count]:
                 pending_metadata.append(
