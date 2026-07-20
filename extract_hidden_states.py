@@ -265,20 +265,50 @@ def prepare_output(args: argparse.Namespace) -> None:
         write_json(existing, config)
 
 
+def unwrap_xla_sharded_tensor(
+    tensor: torch.Tensor,
+    *,
+    source: str,
+) -> torch.Tensor:
+    """Return the base XLA tensor inside Python SPMD wrappers."""
+
+    from torch_xla.distributed.spmd.xla_sharded_tensor import (
+        XLAShardedTensor,
+    )
+
+    wrapper_depth = 0
+
+    while isinstance(tensor, XLAShardedTensor):
+        if not hasattr(tensor, "global_tensor"):
+            raise RuntimeError(
+                f"{source} became an XLAShardedTensor without global_tensor "
+                "before it could be unwrapped"
+            )
+
+        tensor = tensor.global_tensor
+        wrapper_depth += 1
+
+        if wrapper_depth > 16:
+            raise RuntimeError(
+                "cyclic or excessively nested XLAShardedTensor wrappers"
+            )
+
+    return tensor
+
+
 class LastTokenCapture:
     """Hooks that retain only one token vector from each required stage."""
 
     def __init__(self, model: MistralModel):
         self.embedding: torch.Tensor | None = None
         self.layers: dict[int, torch.Tensor] = {}
+
         self.handles = [
             model.embed_tokens.register_forward_hook(
                 self._embedding_hook
             )
         ]
 
-        # Transformers hidden_states[1:] contains post-layer 0..30,
-        # followed by the post-final-norm state after layer 31.
         for index, layer in enumerate(model.layers[:-1]):
             self.handles.append(
                 layer.register_forward_hook(
@@ -287,7 +317,9 @@ class LastTokenCapture:
             )
 
         self.handles.append(
-            model.norm.register_forward_hook(self._norm_hook)
+            model.norm.register_forward_hook(
+                self._norm_hook
+            )
         )
 
     def clear(self) -> None:
@@ -300,7 +332,17 @@ class LastTokenCapture:
         _inputs: Any,
         output: torch.Tensor,
     ) -> None:
-        self.embedding = output[:, -1, :].clone()
+        output = unwrap_xla_sharded_tensor(
+            output,
+            source="embedding hook output",
+        )
+
+        captured = output[:, -1, :].clone()
+
+        self.embedding = unwrap_xla_sharded_tensor(
+            captured,
+            source="embedding hook capture",
+        )
 
     def _layer_hook(self, index: int):
         def hook(
@@ -313,7 +355,18 @@ class LastTokenCapture:
                 if isinstance(output, tuple)
                 else output
             )
-            self.layers[index] = hidden[:, -1, :].clone()
+
+            hidden = unwrap_xla_sharded_tensor(
+                hidden,
+                source=f"layer {index} hook output",
+            )
+
+            captured = hidden[:, -1, :].clone()
+
+            self.layers[index] = unwrap_xla_sharded_tensor(
+                captured,
+                source=f"layer {index} hook capture",
+            )
 
         return hook
 
@@ -323,29 +376,40 @@ class LastTokenCapture:
         _inputs: Any,
         output: torch.Tensor,
     ) -> None:
-        self.layers[31] = output[:, -1, :].clone()
+        output = unwrap_xla_sharded_tensor(
+            output,
+            source="norm hook output",
+        )
 
-    def stacked(self) -> torch.Tensor:
+        captured = output[:, -1, :].clone()
+
+        self.layers[31] = unwrap_xla_sharded_tensor(
+            captured,
+            source="norm hook capture",
+        )
+
+    def ordered(self) -> list[torch.Tensor]:
         if (
             self.embedding is None
             or set(self.layers) != set(range(32))
         ):
             raise RuntimeError(
-                f"incomplete hook capture: "
-                f"layers={sorted(self.layers)}"
+                f"incomplete hook capture: layers={sorted(self.layers)}"
             )
 
-        return torch.cat(
-            [
-                self.embedding[:, None, :],
-                torch.stack(
-                    [
-                        self.layers[index]
-                        for index in range(32)
-                    ],
-                    dim=1,
-                ),
+        return [
+            self.embedding,
+            *[
+                self.layers[index]
+                for index in range(32)
             ],
+        ]
+
+    def stacked(self) -> torch.Tensor:
+        # Used by replicated mode only. SPMD must call
+        # spmd_captures_to_cpu() instead.
+        return torch.stack(
+            self.ordered(),
             dim=1,
         )
 
@@ -354,88 +418,69 @@ class LastTokenCapture:
             handle.remove()
 
 
-def spmd_tensor_to_cpu(
-    tensor: torch.Tensor,
+def spmd_captures_to_cpu(
+    capture: LastTokenCapture,
 ) -> torch.Tensor:
-    """Materialize an SPMD result as an ordinary CPU tensor.
+    """Batch-transfer captures and stack them only after reaching CPU."""
 
-    XLAShardedTensor normally acts as a storage-less wrapper around an
-    underlying XLA tensor in its ``global_tensor`` attribute.
+    tensors: list[torch.Tensor] = []
 
-    PyTorch/XLA 2.9 can also propagate an XLAShardedTensor instance without
-    that Python attribute. In that representation, the subclass object's own
-    TensorImpl is the real XLA tensor.
-
-    Conventional wrappers are recursively unwrapped. Attribute-less propagated
-    tensors are passed directly to the C++ transfer functions while Python
-    tensor-subclass dispatch is disabled. The returned value must be a regular,
-    storage-backed CPU torch.Tensor.
-    """
-
-    from torch_xla.distributed.spmd.xla_sharded_tensor import (
-        XLAShardedTensor,
-    )
-
-    wrapper_depth = 0
-
-    while isinstance(tensor, XLAShardedTensor):
-        if not hasattr(tensor, "global_tensor"):
-            # This instance is backed directly by XLATensorImpl. Do not call
-            # Python tensor operations on it because its __torch_dispatch__
-            # implementation assumes global_tensor exists.
-            break
-
-        tensor = tensor.global_tensor
-        wrapper_depth += 1
-
-        if wrapper_depth > 16:
-            raise RuntimeError(
-                "cyclic or excessively nested "
-                "XLAShardedTensor wrappers"
-            )
-
-    if (
-        not isinstance(tensor, torch.Tensor)
-        or tensor.device.type != "xla"
-    ):
-        raise RuntimeError(
-            "expected an XLA-backed tensor, got "
-            f"type={type(tensor).__name__} "
-            f"device={tensor.device}"
+    for index, tensor in enumerate(capture.ordered()):
+        tensor = unwrap_xla_sharded_tensor(
+            tensor,
+            source=f"ordered capture {index}",
         )
 
-    # This is the actual torch-dispatch guard. It differs from
-    # DisableTorchFunctionSubclass, which only affects __torch_function__.
+        if (
+            type(tensor) is not torch.Tensor
+            or tensor.device.type != "xla"
+        ):
+            raise RuntimeError(
+                f"ordered capture {index} is not a base XLA tensor: "
+                f"type={type(tensor).__name__} "
+                f"device={tensor.device}"
+            )
+
+        tensors.append(tensor)
+
     dispatch_guard = torch._C._DisableTorchDispatch()
 
     try:
         torch_xla._XLAC._xla_sync_multi(
-            [tensor],
+            tensors,
             devices=[],
             wait=True,
             sync_xla_data=False,
         )
-        host = torch_xla._XLAC._xla_get_cpu_tensors(
-            [tensor]
-        )[0]
+
+        host_tensors = torch_xla._XLAC._xla_get_cpu_tensors(
+            tensors
+        )
     finally:
         del dispatch_guard
 
-    if (
-        type(host) is not torch.Tensor
-        or host.device.type != "cpu"
-    ):
+    if len(host_tensors) != 33:
         raise RuntimeError(
-            "XLA host transfer did not return a base CPU tensor: "
-            f"type={type(host).__name__} "
-            f"device={host.device}"
+            f"expected 33 host tensors, received {len(host_tensors)}"
         )
 
-    # Fail here with a focused error rather than later inside
-    # safetensors' shared-storage discovery.
-    host.untyped_storage().data_ptr()
+    for index, host in enumerate(host_tensors):
+        if (
+            type(host) is not torch.Tensor
+            or host.device.type != "cpu"
+        ):
+            raise RuntimeError(
+                f"XLA host transfer {index} is not a base CPU tensor: "
+                f"type={type(host).__name__} "
+                f"device={host.device}"
+            )
 
-    return host
+        host.untyped_storage().data_ptr()
+
+    return torch.stack(
+        host_tensors,
+        dim=1,
+    )
 
 
 def load_model_for_rank(
@@ -1094,9 +1139,7 @@ def extract_spmd(
 
             # Compose captures with normal subclass dispatch, then transfer the
             # underlying XLA TensorImpl through the guarded C++ conversion path.
-            host = spmd_tensor_to_cpu(
-                capture.stacked()
-            )[:real_count]
+            host = spmd_captures_to_cpu(capture)[:real_count]
 
             captured.append(host)
 
