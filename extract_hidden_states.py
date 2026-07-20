@@ -412,14 +412,10 @@ def flush_shard(
     filename = f"shard-{shard_number:05d}.safetensors"
     path = rank_dir / filename
     combined = torch.cat(captured, dim=0)
-    # XLA tensors retain opaque storage even after .cpu()/.clone();
-    # round-trip through numpy to guarantee native CPU storage for safetensors.
-    emb_np = combined[:, 0, :].cpu().float().numpy()
-    hs_np = combined[:, 1:, :].cpu().float().numpy()
     save_file(
         {
-            "embedding": torch.from_numpy(emb_np),
-            "hidden_states": torch.from_numpy(hs_np),
+            "embedding": combined[:, 0, :].contiguous(),
+            "hidden_states": combined[:, 1:, :].contiguous(),
         },
         path,
     )
@@ -631,8 +627,14 @@ def extract_spmd(
             # the duplicated padding records on the host. Slicing first could
             # create a leading dimension that is not divisible by the mesh.
             torch_xla.sync(wait=True)
-            host = capture.stacked().cpu()[:real_count]
-            captured.append(host)
+            # clear_sharding converts XlaShardedTensor → regular XLA tensor,
+            # then .cpu().numpy() round-trips to native CPU storage that
+            # safetensors can serialise (XlaShardedTensor.cpu() keeps opaque
+            # storage whose data_ptr() is invalid).
+            xla_result = capture.stacked()
+            xs.clear_sharding(xla_result)
+            host_np = xla_result.cpu().numpy()[:real_count]
+            captured.append(torch.from_numpy(host_np))
             for record, token_count, truncated in batch[:real_count]:
                 pending_metadata.append(
                     {
