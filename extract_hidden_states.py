@@ -1574,6 +1574,13 @@ def main() -> None:
         set(args.buckets)
     )
 
+    if not args.input_jsonl.is_file():
+        raise FileNotFoundError(
+            f"input JSONL does not exist: {args.input_jsonl}\n"
+            "For the published scaled CoQA inputs, run: "
+            "python prepare_coqa_inputs.py"
+        )
+
     if (
         args.batch_size < 1
         or args.shard_size < 1
