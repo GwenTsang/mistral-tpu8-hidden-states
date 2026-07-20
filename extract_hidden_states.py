@@ -412,19 +412,13 @@ def flush_shard(
     filename = f"shard-{shard_number:05d}.safetensors"
     path = rank_dir / filename
     combined = torch.cat(captured, dim=0)
-    tensors = {
-        "embedding": combined[:, 0, :].contiguous(),
-        "hidden_states": combined[:, 1:, :].contiguous(),
-    }
-    # XLA SPMD tensors keep opaque storage whose data_ptr() is invalid
-    # even after .cpu(); roundtrip through xm.save / torch.load to
-    # obtain genuine CPU tensors that safetensors can serialise.
-    import io
-    buf = io.BytesIO()
-    xm.save(tensors, buf)
-    buf.seek(0)
-    cpu_tensors = torch.load(buf, map_location="cpu", weights_only=True)
-    save_file(cpu_tensors, path)
+    save_file(
+        {
+            "embedding": combined[:, 0, :].contiguous(),
+            "hidden_states": combined[:, 1:, :].contiguous(),
+        },
+        path,
+    )
     relative = path.relative_to(output).as_posix()
     for offset, row in enumerate(pending_metadata):
         row.update(
@@ -629,12 +623,18 @@ def extract_spmd(
                     return_dict=False,
                 )
             del output, input_ids, attention_mask
-            # Gather the small [global_batch, 33, 4096] result, then discard
-            # the duplicated padding records on the host. Slicing first could
-            # create a leading dimension that is not divisible by the mesh.
+            # In SPMD the hook outputs are implicitly sharded on the
+            # batch ("fsdp") axis.  Mark as fully replicated to trigger
+            # an all-gather, sync, then round-trip through numpy so the
+            # resulting CPU tensors have native storage that safetensors
+            # can serialise.
+            stacked = capture.stacked()
+            stacked = xs.mark_sharding(
+                stacked, mesh, (None,) * stacked.ndim
+            )
             torch_xla.sync(wait=True)
-            host = capture.stacked().cpu()[:real_count]
-            captured.append(host)
+            host_np = stacked.cpu().detach().numpy()[:real_count]
+            captured.append(torch.from_numpy(host_np.copy()))
             for record, token_count, truncated in batch[:real_count]:
                 pending_metadata.append(
                     {
