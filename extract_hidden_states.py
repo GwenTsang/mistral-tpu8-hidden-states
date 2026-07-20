@@ -271,10 +271,7 @@ def spmd_tensor_to_cpu(tensor: torch.Tensor) -> torch.Tensor:
     wrapper_depth = 0
     while isinstance(tensor, XLAShardedTensor):
         if not hasattr(tensor, "global_tensor"):
-            raise RuntimeError(
-                "PyTorch/XLA returned an XLAShardedTensor without global_tensor; "
-                "cannot safely materialize this activation on the host"
-            )
+            break
         tensor = tensor.global_tensor
         wrapper_depth += 1
         if wrapper_depth > 16:
