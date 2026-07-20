@@ -299,9 +299,10 @@ def unwrap_xla_sharded_tensor(
 class LastTokenCapture:
     """Hooks that retain only one token vector from each required stage."""
 
-    def __init__(self, model: MistralModel):
+    def __init__(self, model: MistralModel, spmd_mesh: Any | None = None):
         self.embedding: torch.Tensor | None = None
         self.layers: dict[int, torch.Tensor] = {}
+        self.spmd_mesh = spmd_mesh
 
         self.handles = [
             model.embed_tokens.register_forward_hook(
@@ -382,6 +383,24 @@ class LastTokenCapture:
         )
 
         captured = output[:, -1, :].clone()
+
+        # The final norm output can retain a feature-sharded FSDP annotation
+        # even though host collection expects batch sharding. On TPU v5e-8
+        # this manifested as NaNs in features 3584:3840 for some 1024-token
+        # records. Explicitly reshard this small [global_batch, hidden] capture
+        # before the host transfer.
+        if self.spmd_mesh is not None:
+            import torch_xla.distributed.spmd as xs
+
+            xs.mark_sharding(
+                captured,
+                self.spmd_mesh,
+                ("fsdp", None),
+            )
+            captured = unwrap_xla_sharded_tensor(
+                captured,
+                source="norm hook batch-resharded capture",
+            )
 
         self.layers[31] = unwrap_xla_sharded_tensor(
             captured,
@@ -589,7 +608,7 @@ def load_spmd_model(
     base_model.config.use_cache = False
     base_model.eval()
 
-    capture = LastTokenCapture(base_model)
+    capture = LastTokenCapture(base_model, spmd_mesh=mesh)
 
     auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
