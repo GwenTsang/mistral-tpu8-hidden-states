@@ -277,9 +277,9 @@ def spmd_tensor_to_cpu(tensor: torch.Tensor) -> torch.Tensor:
         if wrapper_depth > 16:
             raise RuntimeError("cyclic or excessively nested XLAShardedTensor wrappers")
 
-    if type(tensor) is not torch.Tensor or tensor.device.type != "xla":
+    if not isinstance(tensor, torch.Tensor) or tensor.device.type != "xla":
         raise RuntimeError(
-            "expected an unwrapped XLA torch.Tensor, got "
+            "expected an XLA-backed tensor, got "
             f"type={type(tensor).__name__} device={tensor.device}"
         )
 
