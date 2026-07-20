@@ -271,15 +271,18 @@ def spmd_tensor_to_cpu(tensor: torch.Tensor) -> torch.Tensor:
     wrapper_depth = 0
     while isinstance(tensor, XLAShardedTensor):
         if not hasattr(tensor, "global_tensor"):
-            break
+            raise RuntimeError(
+                "PyTorch/XLA returned an XLAShardedTensor without global_tensor; "
+                "cannot safely materialize this activation on the host"
+            )
         tensor = tensor.global_tensor
         wrapper_depth += 1
         if wrapper_depth > 16:
             raise RuntimeError("cyclic or excessively nested XLAShardedTensor wrappers")
 
-    if not isinstance(tensor, torch.Tensor) or tensor.device.type != "xla":
+    if type(tensor) is not torch.Tensor or tensor.device.type != "xla":
         raise RuntimeError(
-            "expected an XLA-backed tensor, got "
+            "expected an unwrapped XLA torch.Tensor, got "
             f"type={type(tensor).__name__} device={tensor.device}"
         )
 
