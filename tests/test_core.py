@@ -1,5 +1,3 @@
-import pytest
-
 from mistral_tpu8.core import (
     assign_bucket,
     extract_first_sentence,
@@ -32,9 +30,19 @@ def test_structured_record_full_and_fst():
     assert fst.text.endswith(" Paris.")
 
 
-def test_prejoined_text_rejects_fst():
-    with pytest.raises(ValueError, match="structured"):
-        record_from_mapping({"text": "already joined"}, 0, answer_view="first_sentence")
+def test_prejoined_text_preserves_declared_fst_view():
+    record = record_from_mapping(
+        {
+            "text": "Summarize: source Summary: First sentence.",
+            "best_answer": "First sentence.",
+            "label": 1,
+        },
+        0,
+        answer_view="first_sentence",
+    )
+    assert record.text == "Summarize: source Summary: First sentence."
+    assert record.answer == "First sentence."
+    assert record.label == 1
 
 
 def test_bucket_assignment_and_truncation_count():

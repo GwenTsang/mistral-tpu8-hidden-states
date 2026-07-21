@@ -113,6 +113,93 @@ The manifest records the source Bucket, SHA-256 checksums, record counts, and
 binary label balance. The source artifact is
 [`GwendalTsang/fepoid-llama-hidden-states`](https://huggingface.co/buckets/GwendalTsang/fepoid-llama-hidden-states).
 
+The exact extractor snapshot used for the corrected CoQA run is permanently
+tagged
+[`coqa-tpu8-handoff-20260720`](https://github.com/GwenTsang/mistral-tpu8-hidden-states/tree/coqa-tpu8-handoff-20260720)
+(commit `354c695f6961a54314ef5e633b0b1718afd6b8c3`). Later HaluEval
+changes do not alter that snapshot or any previously uploaded artifact.
+
+## Paper-scale HaluEval handoff
+
+HaluEval is prepared in two checkpointed A100 Jobs:
+
+- [source indices 0–4,999](https://huggingface.co/jobs/GwendalTsang/6a5f2b08d09dc1f57c6bee40)
+- [source indices 5,000–9,999](https://huggingface.co/jobs/GwendalTsang/6a5f2b0813e6ef894d5497de)
+
+Their persistent output is
+[`GwendalTsang/fepoid-halueval-prepared`](https://huggingface.co/buckets/GwendalTsang/fepoid-halueval-prepared).
+Each job generates Mistral summaries, constructs the first-sentence view and
+assigns independent full/FST labels with
+[`google/t5_11b_trueteacher_and_anli`](https://huggingface.co/google/t5_11b_trueteacher_and_anli).
+
+After **both** Jobs report successful completion, pull and validate their two
+parts with:
+
+```bash
+python prepare_halueval_inputs.py
+```
+
+The command rejects checkpoint-only or incomplete parts and creates:
+
+| File | Records | Purpose |
+| --- | ---: | --- |
+| `prepared_data/halueval_train_full.jsonl` | 8,000 | paper train pool, full answers |
+| `prepared_data/halueval_test_full.jsonl` | 2,000 | fixed test, full answers |
+| `prepared_data/halueval_train_fst.jsonl` | 8,000 | paper train pool, FST answers |
+| `prepared_data/halueval_test_fst.jsonl` | 2,000 | fixed test, FST answers |
+
+The 10% probe-validation subset is selected later from the 8,000-record train
+pool. The preparation manifest records source/output hashes, counts and label
+balances. Full and FST labels are not assumed to be identical.
+
+### Kaggle TPU v5e-8 command
+
+After the one-time dependency installation and mandatory Kaggle session
+restart described above, use a fresh cell:
+
+```python
+import os
+from kaggle_secrets import UserSecretsClient
+
+os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
+```
+
+Then update the repository and launch all four sequential passes:
+
+```bash
+%cd /kaggle/working/mistral-tpu8-hidden-states
+!git pull --ff-only
+!PYTHONUNBUFFERED=1 XLA_SYNC_WAIT=1 python run_halueval_tpu.py \
+    --bucket GwendalTsang/mistral-7b-hidden-states-tpu8
+```
+
+The orchestrator performs the pull/merge, extraction, local validation and
+final Bucket sync. It uses these destination prefixes:
+
+- `halueval/train/full`
+- `halueval/test/full`
+- `halueval/train/fst`
+- `halueval/test/fst`
+
+If Kaggle stops, rerun the same command in the same working directory. Partial
+local outputs use `--resume`; completed and validated outputs are skipped and
+resynced. To run a subset, add for example `--only test-full test-fst`. Use
+`--overwrite` only when intentionally replacing all selected local outputs.
+Every new run manifest includes the Git commit and SHA-256 hashes of the
+extractor, core input logic and pinned requirements, so incompatible code
+cannot silently resume an older artifact.
+
+After the TPU uploads finish, pull and independently revalidate all four
+artifacts on another machine with:
+
+```bash
+python pull_halueval_outputs.py \
+  --bucket GwendalTsang/mistral-7b-hidden-states-tpu8
+```
+
+This defaults to `downloaded_outputs/halueval`. Add `--only test-full` for a
+partial download or `--skip-sha256` only for a quick structural check.
+
 ## Run on all eight TPU devices
 
 No `torchrun` wrapper is needed. The default SPMD execution mode controls and

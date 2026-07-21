@@ -165,6 +165,39 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
+def code_provenance() -> dict[str, Any]:
+    """Fingerprint the exact extractor implementation used by a run."""
+
+    root = Path(__file__).resolve().parent
+    commit = None
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        commit = result.stdout.strip() or None
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        # Source archives may intentionally omit .git. File hashes below are
+        # sufficient to identify the executable implementation in that case.
+        pass
+
+    files = (
+        root / "extract_hidden_states.py",
+        root / "src" / "mistral_tpu8" / "core.py",
+        root / "requirements.txt",
+    )
+    return {
+        "git_commit": commit,
+        "files": {
+            path.relative_to(root).as_posix(): sha256(path)
+            for path in files
+        },
+    }
+
+
 def load_records(args: argparse.Namespace) -> list[InputRecord]:
     stop = (
         args.start_index + args.max_samples
@@ -201,7 +234,8 @@ def load_records(args: argparse.Namespace) -> list[InputRecord]:
 
 def planned_config(args: argparse.Namespace) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "code_provenance": code_provenance(),
         "model_id": args.model_id,
         "revision": args.revision,
         "input_jsonl": str(args.input_jsonl.resolve()),

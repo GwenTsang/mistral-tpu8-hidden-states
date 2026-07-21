@@ -157,10 +157,10 @@ def record_from_mapping(
         raise ValueError(f"unsupported answer_view={answer_view!r}")
 
     if row.get(text_column) not in (None, ""):
-        if answer_view != "full":
-            raise ValueError(
-                "first-sentence truncation requires structured context/question/answer fields"
-            )
+        # A prejoined record is already the exact model input.  In particular,
+        # the HaluEval handoff supplies separate full and FST JSONL files with
+        # their summarization prompts prejoined.  Preserve that text verbatim;
+        # ``answer_view`` remains useful provenance in the run manifest.
         return InputRecord(
             source_index=source_index,
             text=str(row[text_column]),
