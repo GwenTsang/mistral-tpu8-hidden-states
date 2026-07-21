@@ -337,6 +337,8 @@ class LastTokenCapture:
         self.embedding: torch.Tensor | None = None
         self.layers: dict[int, torch.Tensor] = {}
         self.spmd_mesh = spmd_mesh
+        self.final_norm_weight = model.norm.weight.detach().cpu().clone()
+        self.final_norm_epsilon = float(model.norm.variance_epsilon)
 
         self.handles = [
             model.embed_tokens.register_forward_hook(
@@ -344,18 +346,29 @@ class LastTokenCapture:
             )
         ]
 
-        for index, layer in enumerate(model.layers[:-1]):
+        # In SPMD, capture the final decoder block before RMSNorm and apply
+        # that small normalization after the tensors reach CPU. Capturing the
+        # FSDP-sharded norm output directly is unsafe on TPU v5e-8: one
+        # 256-feature partition can intermittently arrive as NaNs for the
+        # 1024-token executable. Replicated mode keeps the exact norm hook.
+        captured_layers = (
+            model.layers
+            if self.spmd_mesh is not None
+            else model.layers[:-1]
+        )
+        for index, layer in enumerate(captured_layers):
             self.handles.append(
                 layer.register_forward_hook(
                     self._layer_hook(index)
                 )
             )
 
-        self.handles.append(
-            model.norm.register_forward_hook(
-                self._norm_hook
+        if self.spmd_mesh is None:
+            self.handles.append(
+                model.norm.register_forward_hook(
+                    self._norm_hook
+                )
             )
-        )
 
     def clear(self) -> None:
         self.embedding = None
@@ -418,27 +431,34 @@ class LastTokenCapture:
 
         captured = output[:, -1, :].clone()
 
-        # The final norm output can retain a feature-sharded FSDP annotation
-        # even though host collection expects batch sharding. On TPU v5e-8
-        # this manifested as NaNs in features 3584:3840 for some 1024-token
-        # records. Explicitly reshard this small [global_batch, hidden] capture
-        # before the host transfer.
-        if self.spmd_mesh is not None:
-            import torch_xla.distributed.spmd as xs
-
-            xs.mark_sharding(
-                captured,
-                self.spmd_mesh,
-                ("fsdp", None),
-            )
-            captured = unwrap_xla_sharded_tensor(
-                captured,
-                source="norm hook batch-resharded capture",
-            )
-
         self.layers[31] = unwrap_xla_sharded_tensor(
             captured,
             source="norm hook capture",
+        )
+
+    def normalize_final_on_cpu(
+        self,
+        hidden: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply Mistral's final RMSNorm to a CPU last-token capture."""
+
+        if hidden.device.type != "cpu":
+            raise ValueError("final CPU RMSNorm received a non-CPU tensor")
+        input_dtype = hidden.dtype
+        hidden_float = hidden.float()
+        variance = hidden_float.pow(2).mean(
+            dim=-1,
+            keepdim=True,
+        )
+        normalized = (
+            hidden_float
+            * torch.rsqrt(
+                variance + self.final_norm_epsilon
+            )
+        ).to(input_dtype)
+        return (
+            self.final_norm_weight.to(input_dtype)
+            * normalized
         )
 
     def ordered(self) -> list[torch.Tensor]:
@@ -529,6 +549,23 @@ def spmd_captures_to_cpu(
             )
 
         host.untyped_storage().data_ptr()
+
+    # The final SPMD capture is the last decoder block before final RMSNorm.
+    # Normalize it on CPU to avoid the corrupt feature-sharded norm transfer.
+    host_tensors[-1] = capture.normalize_final_on_cpu(
+        host_tensors[-1]
+    )
+
+    nonfinite_layers = [
+        index - 1
+        for index, host in enumerate(host_tensors)
+        if not torch.isfinite(host.float()).all()
+    ]
+    if nonfinite_layers:
+        raise RuntimeError(
+            "non-finite SPMD captures before shard write; "
+            f"layers={nonfinite_layers}"
+        )
 
     return torch.stack(
         host_tensors,

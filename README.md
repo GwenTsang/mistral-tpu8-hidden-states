@@ -182,6 +182,14 @@ final Bucket sync. It uses these destination prefixes:
 - `halueval/train/fst`
 - `halueval/test/fst`
 
+Before a long pass, the orchestrator runs an eight-record 1024-token hardware
+regression test drawn from inputs that previously exposed a TPU v5e SPMD
+final-RMSNorm transfer defect. In SPMD mode, the extractor now captures the
+last decoder block before RMSNorm and applies the exact 4096-value final
+RMSNorm on CPU after host transfer. It aborts before writing a shard if any
+layer is non-finite. Use `--preflight-only` to run just this gate; do not use
+`--skip-preflight` for a new TPU runtime.
+
 If Kaggle stops, rerun the same command in the same working directory. Partial
 local outputs use `--resume`; completed and validated outputs are skipped and
 resynced. To run a subset, add for example `--only test-full test-fst`. Use

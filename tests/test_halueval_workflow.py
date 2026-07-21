@@ -1,7 +1,11 @@
 import json
 
 from prepare_halueval_inputs import PartSpec, summary_prompt, validate_part
-from run_halueval_tpu import completed_and_valid
+from run_halueval_tpu import (
+    REGRESSION_LINE_INDICES,
+    completed_and_valid,
+    write_regression_sample,
+)
 
 
 def write_jsonl(path, rows):
@@ -66,3 +70,16 @@ def test_completed_and_valid_requires_matching_counts(tmp_path):
     )
     assert completed_and_valid(output, 8_000)
     assert not completed_and_valid(output, 2_000)
+
+
+def test_regression_sample_uses_known_problematic_line_positions(tmp_path):
+    source = tmp_path / "source.jsonl"
+    destination = tmp_path / "sample.jsonl"
+    rows = [{"line": index} for index in range(100)]
+    write_jsonl(source, rows)
+    write_regression_sample(source, destination)
+    observed = [
+        json.loads(line)["line"]
+        for line in destination.read_text().splitlines()
+    ]
+    assert observed == list(REGRESSION_LINE_INDICES)

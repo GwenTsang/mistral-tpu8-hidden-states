@@ -64,6 +64,11 @@ RUNS = (
     ),
 )
 
+# These line positions in the full train input exposed the TPU v5e SPMD
+# final-RMSNorm transfer regression (layer 31, features 3584:3840, bucket
+# 1024). Keep them as a mandatory hardware preflight before long runs.
+REGRESSION_LINE_INDICES = (7, 11, 16, 22, 25, 29, 84, 88)
+
 
 def render(command: list[str]) -> str:
     return shlex.join(command)
@@ -93,6 +98,21 @@ def completed_and_valid(output: Path, expected_records: int) -> bool:
     )
 
 
+def write_regression_sample(source: Path, destination: Path) -> None:
+    wanted = set(REGRESSION_LINE_INDICES)
+    selected = []
+    with source.open(encoding="utf-8") as handle:
+        for index, line in enumerate(handle):
+            if index in wanted:
+                selected.append(line)
+    if len(selected) != len(wanted):
+        raise ValueError(
+            f"regression sample expected {len(wanted)} records, "
+            f"observed {len(selected)}"
+        )
+    destination.write_text("".join(selected), encoding="utf-8")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -110,6 +130,8 @@ def main() -> None:
     )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--skip-pull", action="store_true")
+    parser.add_argument("--skip-preflight", action="store_true")
+    parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -139,9 +161,67 @@ def main() -> None:
         )
     if not args.dry_run and shutil.which("hf") is None:
         raise RuntimeError("the `hf` CLI is required; install huggingface_hub")
-
     if not args.dry_run:
         args.output_root.mkdir(parents=True, exist_ok=True)
+
+    if not args.skip_preflight:
+        sample_input = args.input_dir / "halueval_regression_1024_full.jsonl"
+        sample_output = args.output_root / "halueval-regression-1024-spmd"
+        if not args.dry_run:
+            write_regression_sample(
+                args.input_dir / "halueval_train_full.jsonl",
+                sample_input,
+            )
+        run(
+            [
+                sys.executable,
+                str(extractor),
+                "--input-jsonl",
+                str(sample_input),
+                "--output-dir",
+                str(sample_output),
+                "--answer-column",
+                "best_answer",
+                "--answer-view",
+                "full",
+                "--batch-size",
+                "1",
+                "--shard-size",
+                "8",
+                "--buckets",
+                "1024",
+                "--expected-world-size",
+                "8",
+                "--execution-mode",
+                "spmd_fsdp",
+                "--overwrite",
+            ],
+            dry_run=args.dry_run,
+        )
+        run(
+            [
+                sys.executable,
+                str(validator),
+                str(sample_output),
+                "--report",
+                str(sample_output / "validation.json"),
+            ],
+            dry_run=args.dry_run,
+        )
+        if args.preflight_only:
+            print(
+                json.dumps(
+                    {
+                        "status": "dry-run" if args.dry_run else "valid",
+                        "preflight": str(sample_output),
+                        "records": len(REGRESSION_LINE_INDICES),
+                    },
+                    indent=2,
+                ),
+                flush=True,
+            )
+            return
+
     completed = []
     for spec in selected:
         input_path = args.input_dir / spec.input_name
