@@ -121,13 +121,14 @@ changes do not alter that snapshot or any previously uploaded artifact.
 
 ## Paper-scale HaluEval handoff
 
-HaluEval is prepared in two checkpointed A100 Jobs:
+HaluEval was prepared in two checkpointed A100 Jobs, then completed from the
+persisted checkpoints after the original account exhausted its credits:
 
-- [source indices 0–4,999](https://huggingface.co/jobs/GwendalTsang/6a5f2b08d09dc1f57c6bee40)
-- [source indices 5,000–9,999](https://huggingface.co/jobs/GwendalTsang/6a5f2b0813e6ef894d5497de)
+- [original indices 0–4,999](https://huggingface.co/jobs/GwendalTsang/6a5f2b08d09dc1f57c6bee40), [checkpointed completion](https://huggingface.co/jobs/Rachidaaa/6a5f4c27d09dc1f57c6bf1a0)
+- [original indices 5,000–9,999](https://huggingface.co/jobs/GwendalTsang/6a5f2b0813e6ef894d5497de), [checkpointed completion](https://huggingface.co/jobs/Rachidaaa/6a5f4c27d09dc1f57c6bf1a1)
 
 Their persistent output is
-[`GwendalTsang/fepoid-halueval-prepared`](https://huggingface.co/buckets/GwendalTsang/fepoid-halueval-prepared).
+[`Rachidaaa/fepoid-halueval-mistral-prepared`](https://huggingface.co/buckets/Rachidaaa/fepoid-halueval-mistral-prepared).
 Each job generates Mistral summaries, constructs the first-sentence view and
 assigns independent full/FST labels with
 [`google/t5_11b_trueteacher_and_anli`](https://huggingface.co/google/t5_11b_trueteacher_and_anli).

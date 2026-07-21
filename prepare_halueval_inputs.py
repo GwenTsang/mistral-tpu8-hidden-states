@@ -21,7 +21,7 @@ from pathlib import Path
 
 
 DEFAULT_SOURCE = (
-    "hf://buckets/GwendalTsang/fepoid-halueval-prepared/"
+    "hf://buckets/Rachidaaa/fepoid-halueval-mistral-prepared/"
     "halueval-mistral-20260721"
 )
 
